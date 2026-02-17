@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"sort"
@@ -36,15 +35,21 @@ type OffsetEntry struct {
 	Topic     string `json:"topic"`
 	Partition int    `json:"partition"`
 	Offset    int64  `json:"offset"`
+	Lag       int64  `json:"lag"`
 }
 
 var (
-	mu      sync.Mutex
-	offsets = make(map[TopicPartition]int64)
+	mu          sync.Mutex
+	offsets     = make(map[TopicPartition]int64)
+	lastOffsets = make(map[TopicPartition]int64)
+
+	sourceConns   = make(map[string]*kafka.Conn)
+	sourceConnsMu sync.Mutex
 )
 
 func main() {
-	broker := flag.String("broker", "localhost:9092", "Kafka bootstrap broker")
+	sourceBroker := flag.String("source-broker", "localhost:9092", "Kafka bootstrap broker")
+	destBroker := flag.String("dest-broker", "localhost:9093", "Kafka bootstrap broker")
 	topic := flag.String("topic", "mm2-offsets.A.internal", "Topic to consume")
 	group := flag.String("group", "mirrormaker-offset-checker", "Consumer group ID")
 	cluster := flag.String("cluster", "A", "Source cluster name to filter on (must match the cluster in the offset messages)")
@@ -52,18 +57,16 @@ func main() {
 	refresh := flag.Duration("refresh", 30*time.Second, "Display refresh interval")
 	flag.Parse()
 
-	conn, err := net.DialTimeout("tcp", *broker, 5*time.Second)
-	if err != nil {
-		log.Fatalf("failed to connect to broker %s: %v", *broker, err)
+	if err := fetchLastOffsets(*sourceBroker); err != nil {
+		log.Fatalf("failed to fetch last offsets: %v", err)
 	}
-	conn.Close()
 
 	if err := loadState(*stateFile); err != nil {
 		log.Fatalf("failed to load state: %v", err)
 	}
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:     []string{*broker},
+		Brokers:     []string{*destBroker},
 		Topic:       *topic,
 		GroupID:     *group,
 		StartOffset: kafka.FirstOffset,
@@ -76,6 +79,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go consumeLoop(ctx, reader, *cluster)
+	go refreshLastOffsets(ctx, *sourceBroker, *refresh)
 
 	ticker := time.NewTicker(*refresh)
 	defer ticker.Stop()
@@ -98,7 +102,105 @@ func main() {
 			if err := reader.Close(); err != nil {
 				log.Printf("failed to close reader: %v", err)
 			}
+			closeSourceConns()
 			return
+		}
+	}
+}
+
+func closeSourceConns() {
+	sourceConnsMu.Lock()
+	defer sourceConnsMu.Unlock()
+	for key, conn := range sourceConns {
+		conn.Close()
+		delete(sourceConns, key)
+	}
+}
+
+func getSourceConn(broker string) (*kafka.Conn, error) {
+	sourceConnsMu.Lock()
+	defer sourceConnsMu.Unlock()
+
+	if conn, ok := sourceConns[broker]; ok {
+		return conn, nil
+	}
+
+	log.Printf("Connecting to broker %s...", broker)
+	conn, err := kafka.Dial("tcp", broker)
+	if err != nil {
+		return nil, err
+	}
+	sourceConns[broker] = conn
+	return conn, nil
+}
+
+func getLeaderConn(addr, topic string, partition int) (*kafka.Conn, error) {
+
+	sourceConnsMu.Lock()
+	defer sourceConnsMu.Unlock()
+
+	if conn, ok := sourceConns[addr]; ok {
+		return conn, nil
+	}
+
+	log.Printf("Connecting to broker %s...", addr)
+	conn, err := kafka.DialLeader(context.Background(), "tcp", addr, topic, partition)
+	if err != nil {
+		return nil, err
+	}
+	sourceConns[addr] = conn
+	return conn, nil
+}
+
+func fetchLastOffsets(broker string) error {
+	conn, err := getSourceConn(broker)
+	if err != nil {
+		return fmt.Errorf("cannot connect to broker: %w", err)
+	}
+
+	partitions, err := conn.ReadPartitions()
+	if err != nil {
+		return fmt.Errorf("cannot read partitions: %w", err)
+	}
+
+	result := make(map[TopicPartition]int64)
+	for _, p := range partitions {
+		leaderAddr := fmt.Sprintf("%s:%d", p.Leader.Host, p.Leader.Port)
+
+		leaderConn, err := getLeaderConn(leaderAddr, p.Topic, p.ID)
+		if err != nil {
+			return fmt.Errorf("cannot connect to leader %s: %w", leaderAddr, err)
+		}
+
+		lastOffset, err := leaderConn.ReadLastOffset()
+		if err != nil {
+			return fmt.Errorf("cannot read last offset for %s/%d: %w", p.Topic, p.ID, err)
+		}
+
+		result[TopicPartition{Topic: p.Topic, Partition: p.ID}] = lastOffset
+	}
+
+	mu.Lock()
+	for tp, offset := range result {
+		lastOffsets[tp] = offset
+	}
+	mu.Unlock()
+
+	return nil
+}
+
+func refreshLastOffsets(ctx context.Context, broker string, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := fetchLastOffsets(broker); err != nil {
+				log.Printf("failed to refresh last offsets: %v", err)
+			}
 		}
 	}
 }
@@ -127,10 +229,18 @@ func saveState(path string) error {
 	mu.Lock()
 	entries := make([]OffsetEntry, 0, len(offsets))
 	for tp, offset := range offsets {
+		var lag int64
+		if last, ok := lastOffsets[tp]; ok {
+			lag = last - offset
+			if lag < 0 {
+				lag = 0
+			}
+		}
 		entries = append(entries, OffsetEntry{
 			Topic:     tp.Topic,
 			Partition: tp.Partition,
 			Offset:    offset,
+			Lag:       lag,
 		})
 	}
 	mu.Unlock()
@@ -206,10 +316,18 @@ func display() {
 	mu.Lock()
 	entries := make([]OffsetEntry, 0, len(offsets))
 	for tp, offset := range offsets {
+		var lag int64
+		if last, ok := lastOffsets[tp]; ok {
+			lag = last - offset
+			if lag < 0 {
+				lag = 0
+			}
+		}
 		entries = append(entries, OffsetEntry{
 			Topic:     tp.Topic,
 			Partition: tp.Partition,
 			Offset:    offset,
+			Lag:       lag,
 		})
 	}
 	mu.Unlock()
@@ -237,9 +355,9 @@ func display() {
 		}
 	}
 
-	fmt.Printf("%-*s  %9s  %s\n", topicWidth, "TOPIC", "PARTITION", "OFFSET")
-	fmt.Printf("%-*s  %9s  %s\n", topicWidth, "-----", "---------", "------")
+	fmt.Printf("%-*s  %9s  %12s  %12s\n", topicWidth, "TOPIC", "PARTITION", "OFFSET", "LAG")
+	fmt.Printf("%-*s  %9s  %12s  %12s\n", topicWidth, "-----", "---------", "------", "---")
 	for _, e := range entries {
-		fmt.Printf("%-*s  %9d  %d\n", topicWidth, e.Topic, e.Partition, e.Offset)
+		fmt.Printf("%-*s  %9d  %12d  %12d\n", topicWidth, e.Topic, e.Partition, e.Offset, e.Lag)
 	}
 }
