@@ -54,7 +54,7 @@ func main() {
 	group := flag.String("group", "mirrormaker-offset-checker", "Consumer group ID")
 	cluster := flag.String("cluster", "A", "Source cluster name to filter on (must match the cluster in the offset messages)")
 	stateFile := flag.String("state-file", "offsets.json", "Local state file path")
-	refresh := flag.Duration("refresh", 30*time.Second, "Display refresh interval")
+	refresh := flag.Duration("refresh", 10*time.Second, "Display refresh interval")
 	flag.Parse()
 
 	if err := fetchLastOffsets(*sourceBroker); err != nil {
