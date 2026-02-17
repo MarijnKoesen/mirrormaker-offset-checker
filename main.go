@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"sort"
@@ -41,6 +42,66 @@ var (
 	mu      sync.Mutex
 	offsets = make(map[TopicPartition]int64)
 )
+
+func main() {
+	broker := flag.String("broker", "localhost:9092", "Kafka bootstrap broker")
+	topic := flag.String("topic", "mm2-offsets.A.internal", "Topic to consume")
+	group := flag.String("group", "mirrormaker-offset-checker", "Consumer group ID")
+	cluster := flag.String("cluster", "A", "Source cluster name to filter on (must match the cluster in the offset messages)")
+	stateFile := flag.String("state-file", "offsets.json", "Local state file path")
+	refresh := flag.Duration("refresh", 30*time.Second, "Display refresh interval")
+	flag.Parse()
+
+	conn, err := net.DialTimeout("tcp", *broker, 5*time.Second)
+	if err != nil {
+		log.Fatalf("failed to connect to broker %s: %v", *broker, err)
+	}
+	conn.Close()
+
+	if err := loadState(*stateFile); err != nil {
+		log.Fatalf("failed to load state: %v", err)
+	}
+
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:     []string{*broker},
+		Topic:       *topic,
+		GroupID:     *group,
+		StartOffset: kafka.FirstOffset,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go consumeLoop(ctx, reader, *cluster)
+
+	ticker := time.NewTicker(*refresh)
+	defer ticker.Stop()
+
+	display()
+
+	for {
+		select {
+		case <-ticker.C:
+			display()
+			if err := saveState(*stateFile); err != nil {
+				log.Printf("failed to save state: %v", err)
+			}
+		case <-sigCh:
+			cancel()
+			fmt.Println("\nShutting down...")
+			if err := saveState(*stateFile); err != nil {
+				log.Printf("failed to save state on exit: %v", err)
+			}
+			if err := reader.Close(); err != nil {
+				log.Printf("failed to close reader: %v", err)
+			}
+			return
+		}
+	}
+}
 
 func loadState(path string) error {
 	data, err := os.ReadFile(path)
@@ -93,7 +154,7 @@ func saveState(path string) error {
 	return os.Rename(tmpPath, path)
 }
 
-func parseMessage(msg kafka.Message) (TopicPartition, int64, bool) {
+func parseMessage(msg kafka.Message, cluster string) (TopicPartition, int64, bool) {
 	if len(msg.Value) == 0 {
 		return TopicPartition{}, 0, false
 	}
@@ -108,6 +169,10 @@ func parseMessage(msg kafka.Message) (TopicPartition, int64, bool) {
 		return TopicPartition{}, 0, false
 	}
 
+	if sk.Cluster != cluster {
+		return TopicPartition{}, 0, false
+	}
+
 	var ov OffsetValue
 	if err := json.Unmarshal(msg.Value, &ov); err != nil {
 		return TopicPartition{}, 0, false
@@ -117,7 +182,7 @@ func parseMessage(msg kafka.Message) (TopicPartition, int64, bool) {
 	return tp, ov.Offset, true
 }
 
-func consumeLoop(ctx context.Context, reader *kafka.Reader) {
+func consumeLoop(ctx context.Context, reader *kafka.Reader, cluster string) {
 	for {
 		msg, err := reader.ReadMessage(ctx)
 		if err != nil {
@@ -127,7 +192,7 @@ func consumeLoop(ctx context.Context, reader *kafka.Reader) {
 			log.Printf("read error: %v", err)
 			continue
 		}
-		tp, offset, ok := parseMessage(msg)
+		tp, offset, ok := parseMessage(msg, cluster)
 		if !ok {
 			continue
 		}
@@ -176,58 +241,5 @@ func display() {
 	fmt.Printf("%-*s  %9s  %s\n", topicWidth, "-----", "---------", "------")
 	for _, e := range entries {
 		fmt.Printf("%-*s  %9d  %d\n", topicWidth, e.Topic, e.Partition, e.Offset)
-	}
-}
-
-func main() {
-	broker := flag.String("broker", "localhost:9092", "Kafka bootstrap broker")
-	topic := flag.String("topic", "mm2-offsets.A.internal", "Topic to consume")
-	group := flag.String("group", "mirrormaker-offset-checker", "Consumer group ID")
-	stateFile := flag.String("state-file", "offsets.json", "Local state file path")
-	refresh := flag.Duration("refresh", time.Second, "Display refresh interval")
-	flag.Parse()
-
-	if err := loadState(*stateFile); err != nil {
-		log.Fatalf("failed to load state: %v", err)
-	}
-
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:     []string{*broker},
-		Topic:       *topic,
-		GroupID:     *group,
-		StartOffset: kafka.FirstOffset,
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	go consumeLoop(ctx, reader)
-
-	ticker := time.NewTicker(*refresh)
-	defer ticker.Stop()
-
-	display()
-
-	for {
-		select {
-		case <-ticker.C:
-			display()
-			if err := saveState(*stateFile); err != nil {
-				log.Printf("failed to save state: %v", err)
-			}
-		case <-sigCh:
-			cancel()
-			fmt.Println("\nShutting down...")
-			if err := saveState(*stateFile); err != nil {
-				log.Printf("failed to save state on exit: %v", err)
-			}
-			if err := reader.Close(); err != nil {
-				log.Printf("failed to close reader: %v", err)
-			}
-			return
-		}
 	}
 }
